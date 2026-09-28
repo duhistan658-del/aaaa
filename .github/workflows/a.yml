@@ -1,0 +1,185 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+
+env:
+  LLVM_VERSION: "18.1.8"
+
+jobs:
+  # ---------------------------------------------------------------- Windows
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 355
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - uses: seanmiddleditch/gha-setup-ninja@v5
+
+      # The LLVM build takes hours the first time; afterwards it is restored from cache.
+      - name: Restore LLVM cache
+        id: llvm-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            llvm-project
+            llvm-build
+          key: llvm-${{ env.LLVM_VERSION }}-win-msvc-v1
+
+      - name: Fetch LLVM source
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: git clone --depth 1 --branch llvmorg-$env:LLVM_VERSION https://github.com/llvm/llvm-project.git
+
+      - name: Configure LLVM + Clang
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: >
+          cmake -S llvm-project/llvm -B llvm-build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl
+          -DLLVM_ENABLE_PROJECTS=clang
+          -DLLVM_TARGETS_TO_BUILD=X86
+          -DLLVM_ENABLE_ASSERTIONS=OFF
+          -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF
+          -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_DOCS=OFF
+          -DCLANG_INCLUDE_TESTS=OFF -DCLANG_INCLUDE_DOCS=OFF
+          -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_LIBXML2=OFF
+          -DLLVM_PARALLEL_LINK_JOBS=2
+
+      # Only the pieces hxjit needs (not the whole of Clang).
+      - name: Build LLVM + Clang (only what hxjit needs)
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: >
+          cmake --build llvm-build --target
+          clangInterpreter clangFrontend clang-resource-headers
+          LLVMOrcJIT LLVMX86CodeGen LLVMX86AsmParser LLVMX86Desc LLVMX86Info
+
+      - name: Save LLVM cache
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            llvm-project
+            llvm-build
+          key: llvm-${{ env.LLVM_VERSION }}-win-msvc-v1
+
+      - name: Build hxjit.dll
+        shell: pwsh
+        run: |
+          $ws = "${{ github.workspace }}".Replace('\','/')
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl `
+            "-DLLVM_DIR=$ws/llvm-build/lib/cmake/llvm" `
+            "-DClang_DIR=$ws/llvm-build/lib/cmake/clang"
+          cmake --build build
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/clang-resources | Out-Null
+          Copy-Item build/hxjit.dll, build/hxjit.lib, native/hxjit.h dist/
+          Copy-Item llvm-project/llvm/LICENSE.TXT dist/LLVM-LICENSE.txt
+          $ver = Get-ChildItem llvm-build/lib/clang | Select-Object -First 1
+          Copy-Item -Recurse "$($ver.FullName)/include" dist/clang-resources/include
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hxjit-windows-x64
+          path: dist
+
+      # Best-effort checks: the package is uploaded even if these fail, so you can inspect it.
+      - name: Smoke test (C)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          cl /nologo /I native examples/smoke.c dist/hxjit.lib /Fe:dist/smoke.exe
+          Push-Location dist
+          ./smoke.exe
+          Pop-Location
+
+      - uses: krdlab/setup-haxe@v1
+        with:
+          haxe-version: 4.3.6
+
+      - name: Haxe example
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          haxelib install hxcpp --quiet
+          haxe build.hxml
+          Copy-Item -Recurse dist/* out/ -Force
+          Push-Location out
+          ./Main.exe
+          Pop-Location
+
+  # ------------------------------------------------------------------ Linux
+  linux:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 llvm-18-dev libclang-18-dev libclang-cpp18-dev cmake haxe
+
+      - name: Build libhxjit.so
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+
+      - name: Smoke test (C)
+        run: |
+          gcc -Inative examples/smoke.c -Lbuild -lhxjit -Wl,-rpath,"$PWD/build" -o build/smoke
+          ./build/smoke
+
+      - name: Haxe example
+        run: |
+          mkdir -p ~/haxelib && haxelib setup ~/haxelib
+          haxelib install hxcpp --quiet
+          haxe build.hxml
+          ./out/Main
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp build/libhxjit.so native/hxjit.h dist/
+          echo "Requires libclang-cpp18 and libLLVM-18 (apt install libclang-cpp18)." > dist/README-linux.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hxjit-linux-x64
+          path: dist
+
+  # ---------------------------------------------------------------- Release
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Zip
+        run: |
+          cd artifacts
+          for d in */; do (cd "$d" && zip -r "../${d%/}.zip" .); done
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip
